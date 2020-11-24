@@ -380,6 +380,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
 
         self.value_record = collections.deque(maxlen=value_stats_window)
         self.entropy_record = collections.deque(maxlen=entropy_stats_window)
+        self.policy_record = collections.deque(maxlen=5)
         self.performance_record = collections.deque(maxlen=5)
         self.value_loss_record = collections.deque(maxlen=value_loss_stats_window)
         self.policy_loss_record = collections.deque(maxlen=policy_loss_stats_window)
@@ -459,6 +460,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 episodic_return = self.gamma * episodic_return + transition["reward"]
             batch_episodic_return.append(episodic_return)
         p_performance = _mean_or_nan(batch_episodic_return)
+        self.policy_record.append(self.model.state_dict)
         self.performance_record.append(p_performance)
         
         p_max = max(self.performance_record)
