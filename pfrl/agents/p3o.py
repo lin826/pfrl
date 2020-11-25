@@ -471,7 +471,8 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
         if self.p_max == self.p_min:
             return 1
         
-        return (p_performance - self.p_min) / (self.p_max - self.p_min)
+        orig_p_weight = (p_performance - self.p_min) / (self.p_max - self.p_min)
+        return max(orig_p_weight, 0.5)
         
     def _update(self, dataset):
         """Update both the policy and the value function."""
