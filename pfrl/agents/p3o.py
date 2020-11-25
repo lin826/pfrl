@@ -362,6 +362,9 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
 
         # Contains episodes used for next update iteration
         self.memory = []
+        self.p_min = None
+        self.p_max = None
+        self.p_weight = None
 
         # Contains transitions of the last episode not moved to self.memory yet
         self.last_episode = []
@@ -380,8 +383,8 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
 
         self.value_record = collections.deque(maxlen=value_stats_window)
         self.entropy_record = collections.deque(maxlen=entropy_stats_window)
-        self.policy_record = collections.deque(maxlen=5)
-        self.performance_record = collections.deque(maxlen=5)
+        # self.policy_record = collections.deque(maxlen=5)
+        # self.performance_record = collections.deque(maxlen=5)
         self.value_loss_record = collections.deque(maxlen=value_loss_stats_window)
         self.policy_loss_record = collections.deque(maxlen=policy_loss_stats_window)
         self.explained_variance = np.nan
@@ -460,15 +463,15 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 episodic_return = self.gamma * episodic_return + transition["reward"]
             batch_episodic_return.append(episodic_return)
         p_performance = _mean_or_nan(batch_episodic_return)
-        self.policy_record.append(self.model.state_dict)
-        self.performance_record.append(p_performance)
+        # self.policy_record.append(self.model.state_dict)
+        # self.performance_record.append(p_performance)
         
-        p_max = max(self.performance_record)
-        p_min = min(self.performance_record)
-        if p_max == p_min:
+        self.p_max = max(self.p_max, p_performance) if self.p_max else p_performance
+        self.p_min = min(self.p_min, p_performance) if self.p_min else p_performance
+        if self.p_max == self.p_min:
             return 1
         
-        return (p_performance - p_min) / (p_max - p_min)
+        return (p_performance - self.p_min) / (self.p_max - self.p_min)
         
     def _update(self, dataset):
         """Update both the policy and the value function."""
@@ -485,7 +488,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
             all_advs = torch.tensor([b["adv"] for b in dataset], device=device)
             std_advs, mean_advs = torch.std_mean(all_advs, unbiased=False)
         
-        p_weight = self._get_p_weight()
+        self.p_weight = self._get_p_weight()
             
         for batch in _yield_minibatches(
             dataset, minibatch_size=self.minibatch_size, num_epochs=self.epochs
@@ -526,7 +529,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 log_probs_old=log_probs_old,
                 advs=advs,
                 vs_teacher=vs_teacher,
-                p_weight=p_weight
+                p_weight=self.p_weight
             )
             loss.backward()
             if self.max_grad_norm is not None:
@@ -811,7 +814,10 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
         return [
             ("average_value", _mean_or_nan(self.value_record)),
             ("average_entropy", _mean_or_nan(self.entropy_record)),
-            ("average_policy_performance", _mean_or_nan(self.performance_record)),
+            ("p_max", _mean_or_nan(self.p_max)),
+            ("p_min", _mean_or_nan(self.p_min)),
+            ("p_weight", _mean_or_nan(self.p_weight)),
+            # ("average_policy_performance", _mean_or_nan(self.performance_record)),
             ("average_value_loss", _mean_or_nan(self.value_loss_record)),
             ("average_policy_loss", _mean_or_nan(self.policy_loss_record)),
             ("n_updates", self.n_updates),
