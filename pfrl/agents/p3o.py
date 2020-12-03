@@ -460,7 +460,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
         for ep in self.memory:
             episodic_return = 0
             for transition in ep:
-                episodic_return = self.gamma * episodic_return + transition["reward"]
+                episodic_return += transition["reward"]
             batch_episodic_return.append(episodic_return)
         p_performance = _mean_or_nan(batch_episodic_return)
         # self.policy_record.append(self.model.state_dict)
