@@ -1,4 +1,5 @@
 import collections
+import copy
 import itertools
 import random
 
@@ -364,7 +365,6 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
         self.memory = []
         self.p_min = None
         self.p_max = None
-        self.p_weight = None
 
         # Contains transitions of the last episode not moved to self.memory yet
         self.last_episode = []
@@ -383,10 +383,11 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
 
         self.value_record = collections.deque(maxlen=value_stats_window)
         self.entropy_record = collections.deque(maxlen=entropy_stats_window)
-        # self.policy_record = collections.deque(maxlen=5)
+        self.policy_record = collections.deque(maxlen=5)
         # self.performance_record = collections.deque(maxlen=5)
         self.value_loss_record = collections.deque(maxlen=value_loss_stats_window)
         self.policy_loss_record = collections.deque(maxlen=policy_loss_stats_window)
+        self.contrast_loss_record = collections.deque(maxlen=5)
         self.explained_variance = np.nan
         self.n_updates = 0
 
@@ -454,7 +455,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
         self.obs_normalizer.experience(states)
 
         
-    def _get_p_weight(self):
+    def _get_p_performance(self):
         # Normalized weighting from the policy performance
         batch_episodic_return = []
         for ep in self.memory:
@@ -462,17 +463,25 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
             for transition in ep:
                 episodic_return += transition["reward"]
             batch_episodic_return.append(episodic_return)
-        p_performance = _mean_or_nan(batch_episodic_return)
-        # self.policy_record.append(self.model.state_dict)
+        return  _mean_or_nan(batch_episodic_return)
         # self.performance_record.append(p_performance)
-        
-        self.p_max = max(self.p_max, p_performance) if self.p_max else p_performance
-        self.p_min = min(self.p_min, p_performance) if self.p_min else p_performance
-        if self.p_max == self.p_min:
-            return 1
-        
-        orig_p_weight = (p_performance - self.p_min) / (self.p_max - self.p_min)
-        return max(orig_p_weight, 0.5)
+
+    def _get_Z(self, current_performance):
+        self.p_max = max(self.p_max, current_performance) if self.p_max else current_performance
+        self.p_min = min(self.p_min, current_performance) if self.p_min else current_performance
+        return self.p_max - self.p_min
+
+    def _get_loss_contrast(self, p_performance, Z, action_distribs, states):
+        loss_contrast = 0
+        for [old_policy, old_policy_performance] in self.policy_record:
+            # Old policy are snapshots of self.model
+            old_policy_action_distribs, _ = old_policy(states)
+            # Z is a normalization factors that makes sure the relative_performance around [-1, 1]
+            relative_performance_weight = (old_policy_performance - p_performance) / Z 
+            # relative_performance_weight < 0 -> maximize div
+            # relative_performance_weight > 0 -> minimize div
+            loss_contrast += relative_performance_weight * torch.mean(torch.distributions.kl.kl_divergence(action_distribs, old_policy_action_distribs))
+        return loss_contrast
         
     def _update(self, dataset):
         """Update both the policy and the value function."""
@@ -489,7 +498,8 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
             all_advs = torch.tensor([b["adv"] for b in dataset], device=device)
             std_advs, mean_advs = torch.std_mean(all_advs, unbiased=False)
         
-        self.p_weight = self._get_p_weight()
+        p_performance = self._get_p_performance()
+        Z = self._get_Z(p_performance)
             
         for batch in _yield_minibatches(
             dataset, minibatch_size=self.minibatch_size, num_epochs=self.epochs
@@ -501,6 +511,8 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 states = self.obs_normalizer(states, update=False)
             actions = torch.tensor([b["action"] for b in batch], device=device)
             distribs, vs_pred = self.model(states)
+
+            loss_contrast = self._get_loss_contrast(p_performance=p_performance, Z=Z, action_distribs=distribs, states=states)
 
             advs = torch.tensor(
                 [b["adv"] for b in batch], dtype=torch.float32, device=device
@@ -530,7 +542,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 log_probs_old=log_probs_old,
                 advs=advs,
                 vs_teacher=vs_teacher,
-                p_weight=self.p_weight
+                loss_contrast=loss_contrast,
             )
             loss.backward()
             if self.max_grad_norm is not None:
@@ -539,6 +551,7 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 )
             self.optimizer.step()
             self.n_updates += 1
+        self.policy_record.append([copy.deepcopy(self.model), p_performance])
 
     def _update_once_recurrent(self, episodes, mean_advs, std_advs):
 
@@ -639,16 +652,16 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 self._update_once_recurrent(minibatch, mean_advs, std_advs)
 
     def _lossfun(
-        self, entropy, vs_pred, log_probs, vs_pred_old, log_probs_old, advs, vs_teacher, p_weight=1
+        self, entropy, vs_pred, log_probs, vs_pred_old, log_probs_old, advs, vs_teacher, loss_contrast=0
     ):      
         prob_ratio = torch.exp(log_probs - log_probs_old)
 
         loss_policy = -torch.mean(
             torch.min(
-                p_weight * prob_ratio * advs,
+                prob_ratio * advs,
                 torch.clamp(prob_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advs,
             ),
-        )
+        ) 
 
         if self.clip_eps_vf is None:
             loss_value_func = F.mse_loss(vs_pred, vs_teacher)
@@ -663,12 +676,13 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
                 )
             )
         loss_entropy = -torch.mean(entropy)
-            
+
         self.value_loss_record.append(float(loss_value_func))
         self.policy_loss_record.append(float(loss_policy))
+        self.contrast_loss_record.append(float(loss_contrast))
 
         loss = (
-            loss_policy
+            loss_policy + loss_contrast
             + self.value_func_coef * loss_value_func
             + self.entropy_coef * loss_entropy
         )
@@ -817,10 +831,10 @@ class P3O(agent.AttributeSavingMixin, agent.BatchAgent):
             ("average_entropy", _mean_or_nan(self.entropy_record)),
             ("p_max", _mean_or_nan(self.p_max)),
             ("p_min", _mean_or_nan(self.p_min)),
-            ("p_weight", _mean_or_nan(self.p_weight)),
             # ("average_policy_performance", _mean_or_nan(self.performance_record)),
             ("average_value_loss", _mean_or_nan(self.value_loss_record)),
             ("average_policy_loss", _mean_or_nan(self.policy_loss_record)),
+            ("average_contrast_loss", _mean_or_nan(self.contrast_loss_record)),
             ("n_updates", self.n_updates),
             ("explained_variance", self.explained_variance),
         ]
